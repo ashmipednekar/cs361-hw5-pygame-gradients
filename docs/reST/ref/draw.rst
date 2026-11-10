@@ -100,6 +100,75 @@ object around the draw calls (see :func:`pygame.Surface.lock` and
 
    .. ## pygame.draw.rect ##
 
+.. function:: gradient_rect
+
+   | :sl:`fill a rectangle or a whole surface with a color gradient`
+   | :sg:`gradient_rect(surface, colors) -> Rect`
+   | :sg:`gradient_rect(surface, colors, rect=None, start_pos=None, end_pos=None, kind='linear') -> Rect`
+
+   Fills a rectangle, or the whole surface, with a linear, radial or conic
+   color gradient. Like the other draw functions, pixels are written
+   directly (colors, including alpha, replace the existing pixels rather
+   than being blended onto them), and the surface's clip area is respected.
+
+   Each pixel ``(x, y)`` is given a value ``t`` between 0 and 1 by the
+   gradient's geometry, and ``t`` is turned into a color by interpolating
+   between the color stops in the same way as :meth:`pygame.Color.lerp`.
+
+   :param Surface surface: surface to draw on
+   :param colors: two or more colors, which are spaced evenly along the
+      gradient, or ``(position, color)`` pairs, where ``position`` is between
+      0 and 1. The two forms can be mixed, positions must not decrease, and
+      two stops at the same position give a hard edge. A single color fills
+      the area with that color.
+   :type colors: sequence of Color or int or tuple(int, int, int, [int]) or
+      tuple(float, color)
+   :param rect: (optional) rectangle to fill; if ``None`` (the default) the
+      whole surface is filled
+   :type rect: Rect or None
+   :param start_pos: (optional) where ``t`` is 0: the start point of a linear
+      gradient, or the center of a radial or conic gradient
+   :type start_pos: tuple(int or float, int or float) or None
+   :param end_pos: (optional) where ``t`` is 1: the end point of a linear
+      gradient, a point on the outer edge of a radial gradient, or the
+      direction where a conic gradient starts
+   :type end_pos: tuple(int or float, int or float) or None
+   :param str kind: (optional) ``'linear'`` (default), ``'radial'`` or
+      ``'conic'``
+
+         | ``'linear'``: ``t`` grows along the line from ``start_pos`` to
+           ``end_pos``. By default it goes from the top row of ``rect`` to
+           its bottom row. If both points are the same, the first color is
+           used.
+         | ``'radial'``: ``t`` is the distance from ``start_pos`` divided by
+           the distance from ``start_pos`` to ``end_pos``. By default the
+           center is the center of ``rect`` and ``t`` reaches 1 at its
+           farthest corner.
+         | ``'conic'``: ``t`` is the angle around ``start_pos``, measured
+           clockwise on screen from the direction of ``end_pos``, as a
+           fraction of a full turn. By default the center is the center of
+           ``rect`` and the angle starts pointing right.
+         |
+
+   :returns: a rect bounding the changed pixels, if nothing is drawn the
+      bounding rect's position will be the position of the given ``rect``
+      parameter and its width and height will be 0
+   :rtype: Rect
+
+   :raises ValueError: if ``kind`` is not recognized, ``colors`` is empty, or
+      a stop position is outside [0, 1] or smaller than the one before it
+
+   .. note::
+      Pixels outside the gradient's range use the nearest end color. The
+      gradient is computed with a table of 1025 interpolated colors (1024
+      steps), which is finer than 8-bit color can show, so a pixel may differ
+      from :meth:`pygame.Color.lerp` by at most 1 per channel. To draw the same gradient every
+      frame, draw it once onto its own surface and blit that surface.
+
+   .. versionadded:: 2.6.2
+
+   .. ## pygame.draw.gradient_rect ##
+
 .. function:: polygon
 
    | :sl:`draw a polygon`

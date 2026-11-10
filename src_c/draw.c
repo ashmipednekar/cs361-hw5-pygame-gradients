@@ -2564,6 +2564,578 @@ draw_round_rect(SDL_Surface *surf, int x1, int y1, int x2, int y2, int radius,
     }
 }
 
+/* ------------------------------------------------------------------------
+ * Gradient fills
+ *
+ * A gradient maps every pixel p to a parameter t in [0, 1] (the geometry
+ * part) and then maps t to a color by interpolating between color stops.
+ *
+ * For speed, the stops are turned into a lookup table (LUT) of pixel values
+ * already mapped to the surface format, so the per-pixel work is computing an
+ * index and storing a value. The table is pre-scaled so that the geometry
+ * produces a LUT index directly ("u" = t * (GRADIENT_LUT_SIZE - 1)).
+ * ---------------------------------------------------------------------- */
+
+/* 1024 steps (1025 entries) so that t = 1/2, 1/4, 1/8, ... land exactly on
+ * an entry and match Color.lerp at those points. */
+#define GRADIENT_LUT_SIZE 1025
+#define GRADIENT_LUT_MAX (GRADIENT_LUT_SIZE - 1)
+
+typedef enum {
+    GRADIENT_LINEAR,
+    GRADIENT_RADIAL,
+    GRADIENT_CONIC
+} GradientKind;
+
+typedef struct {
+    double pos;
+    Uint8 rgba[4];
+} GradientStop;
+
+/* Converts a scaled gradient parameter to a LUT index, clamping to the end
+ * colors. Written so that NaN maps to the first color. */
+static PG_INLINE int
+_gradient_index(double u)
+{
+    if (!(u > 0.0))
+        return 0;
+    if (u >= GRADIENT_LUT_MAX)
+        return GRADIENT_LUT_MAX;
+    return (int)(u + 0.5);
+}
+
+/* Fast atan2 for conic gradients. A minimax polynomial for atan on [0, 1]
+ * (max error about 1e-5 radians, far below the 2*pi/1024 radians between
+ * LUT entries), extended to all quadrants by symmetry. Exact on the axes.
+ * Several times faster than the C library atan2. */
+static PG_INLINE double
+_gradient_atan2(double y, double x)
+{
+    double ax = fabs(x), ay = fabs(y), z, z2, r;
+
+    if (ax == 0.0 && ay == 0.0)
+        return 0.0;
+    z = (ay > ax) ? ax / ay : ay / ax;
+    z2 = z * z;
+    r = z * (0.99997726 +
+             z2 * (-0.33262347 +
+                   z2 * (0.19354346 +
+                         z2 * (-0.11643287 +
+                               z2 * (0.05265332 + z2 * -0.01172120)))));
+    if (ay > ax)
+        r = M_PI / 2.0 - r;
+    if (x < 0.0)
+        r = M_PI - r;
+    if (y < 0.0)
+        r = -r;
+    return r;
+}
+
+/* Parses the colors argument: a sequence of colors (evenly spaced), or of
+ * (position, color) pairs, or a mix of both. Positions must be within [0, 1]
+ * and non-decreasing. On success returns a PyMem-allocated array of stops
+ * that the caller must free. Returns NULL with an exception set on failure.
+ */
+static GradientStop *
+_gradient_parse_stops(PyObject *colors, SDL_Surface *surf,
+                      Py_ssize_t *n_out)
+{
+    PyObject *seq, *item, *posobj, *colorobj;
+    GradientStop *stops;
+    Py_ssize_t i, n;
+    double prev = 0.0;
+
+    if (PyUnicode_Check(colors)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "colors must be a sequence of colors or "
+                        "(position, color) pairs");
+        return NULL;
+    }
+    seq = PySequence_Fast(colors,
+                          "colors must be a sequence of colors or "
+                          "(position, color) pairs");
+    if (!seq)
+        return NULL;
+
+    n = PySequence_Fast_GET_SIZE(seq);
+    if (n < 1) {
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+                        "colors must contain at least one color");
+        return NULL;
+    }
+
+    stops = PyMem_New(GradientStop, n);
+    if (!stops) {
+        Py_DECREF(seq);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    for (i = 0; i < n; ++i) {
+        GradientStop *stop = &stops[i];
+        int ok;
+
+        item = PySequence_Fast_GET_ITEM(seq, i); /* borrowed */
+        stop->pos = (n == 1) ? 0.0 : (double)i / (double)(n - 1);
+        colorobj = item;
+        Py_INCREF(colorobj);
+
+        /* A 2-item sequence starting with a number is a (position, color)
+         * stop. Colors are never 2-item sequences, so this is unambiguous. */
+        if (!PyUnicode_Check(item) && PySequence_Check(item) &&
+            PySequence_Size(item) == 2) {
+            posobj = PySequence_GetItem(item, 0);
+            if (!posobj)
+                goto error_color;
+            if (PyFloat_Check(posobj) || PyLong_Check(posobj)) {
+                stop->pos = PyFloat_AsDouble(posobj);
+                Py_DECREF(posobj);
+                if (stop->pos == -1.0 && PyErr_Occurred())
+                    goto error_color;
+                Py_DECREF(colorobj);
+                colorobj = PySequence_GetItem(item, 1);
+                if (!colorobj)
+                    goto error;
+            }
+            else {
+                Py_DECREF(posobj);
+            }
+        }
+        else if (PyErr_Occurred()) {
+            goto error_color;
+        }
+
+        if (PyLong_Check(colorobj)) {
+            Uint32 mapped = (Uint32)PyLong_AsLong(colorobj);
+            if (PyErr_Occurred())
+                goto error_color;
+            SDL_GetRGBA(mapped, surf->format, &stop->rgba[0], &stop->rgba[1],
+                        &stop->rgba[2], &stop->rgba[3]);
+            ok = 1;
+        }
+        else {
+            ok = pg_RGBAFromFuzzyColorObj(colorobj, stop->rgba);
+        }
+        Py_DECREF(colorobj);
+        if (!ok)
+            goto error; /* pg_RGBAFromFuzzyColorObj set the exception */
+
+        if (!(stop->pos >= 0.0 && stop->pos <= 1.0)) {
+            PyErr_Format(PyExc_ValueError,
+                         "color stop position must be in the range [0, 1] "
+                         "(index %zd)",
+                         i);
+            goto error;
+        }
+        if (stop->pos < prev) {
+            PyErr_Format(PyExc_ValueError,
+                         "color stop positions must be non-decreasing "
+                         "(index %zd)",
+                         i);
+            goto error;
+        }
+        prev = stop->pos;
+    }
+
+    Py_DECREF(seq);
+    *n_out = n;
+    return stops;
+
+error_color:
+    Py_DECREF(colorobj);
+error:
+    Py_DECREF(seq);
+    PyMem_Free(stops);
+    return NULL;
+}
+
+/* Fills lut[0..GRADIENT_LUT_SIZE-1] with mapped pixel values. Entry k holds
+ * the color at t = k / (GRADIENT_LUT_SIZE - 1). Interpolation uses the same
+ * formula and rounding as Color.lerp, so lut[0] and lut[GRADIENT_LUT_MAX]
+ * are exactly the first and last colors. */
+static void
+_gradient_build_lut(SDL_PixelFormat *format, const GradientStop *stops,
+                    Py_ssize_t n, Uint32 *lut)
+{
+    Py_ssize_t seg = 0;
+    int k, c;
+
+    for (k = 0; k < GRADIENT_LUT_SIZE; ++k) {
+        double t = (double)k / GRADIENT_LUT_MAX;
+        Uint8 rgba[4];
+        const Uint8 *src;
+
+        if (t <= stops[0].pos) {
+            src = stops[0].rgba;
+        }
+        else if (t >= stops[n - 1].pos) {
+            src = stops[n - 1].rgba;
+        }
+        else {
+            double span, f;
+
+            /* t only increases, so the segment only moves forward. */
+            while (seg < n - 2 && t > stops[seg + 1].pos) {
+                ++seg;
+            }
+            span = stops[seg + 1].pos - stops[seg].pos;
+            f = span > 0.0 ? (t - stops[seg].pos) / span : 1.0;
+            for (c = 0; c < 4; ++c) {
+                rgba[c] = (Uint8)(stops[seg].rgba[c] * (1.0 - f) +
+                                  stops[seg + 1].rgba[c] * f + 0.5);
+            }
+            src = rgba;
+        }
+        lut[k] = SDL_MapRGBA(format, src[0], src[1], src[2], src[3]);
+    }
+}
+
+/* Stores w mapped pixel values from src into a surface row. */
+static void
+_gradient_store_row(Uint8 *dst, const Uint32 *src, int w, int bpp)
+{
+    int i;
+
+    switch (bpp) {
+        case 1:
+            for (i = 0; i < w; ++i) {
+                dst[i] = (Uint8)src[i];
+            }
+            break;
+        case 2:
+            for (i = 0; i < w; ++i) {
+                ((Uint16 *)dst)[i] = (Uint16)src[i];
+            }
+            break;
+        case 3:
+            for (i = 0; i < w; ++i) {
+                Uint32 color = src[i];
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+                color <<= 8;
+#endif
+                memcpy(dst + i * 3, &color, 3);
+            }
+            break;
+        default: /* case 4 */
+            memcpy(dst, src, (size_t)w * 4);
+            break;
+    }
+}
+
+/* Fills one surface row with a single mapped pixel value. */
+static void
+_gradient_fill_row(Uint8 *dst, Uint32 color, int w, int bpp)
+{
+    int i;
+
+    switch (bpp) {
+        case 1:
+            memset(dst, (Uint8)color, (size_t)w);
+            break;
+        case 2:
+            for (i = 0; i < w; ++i) {
+                ((Uint16 *)dst)[i] = (Uint16)color;
+            }
+            break;
+        case 3:
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+            color <<= 8;
+#endif
+            for (i = 0; i < w; ++i) {
+                memcpy(dst + i * 3, &color, 3);
+            }
+            break;
+        default: /* case 4 */
+            for (i = 0; i < w; ++i) {
+                ((Uint32 *)dst)[i] = color;
+            }
+            break;
+    }
+}
+
+/* Fills area (already clipped to the surface) with the gradient. Pixel
+ * (x, y) is sampled at the integer point (x, y). Does not touch any Python
+ * objects, so it can run with the GIL released. rowbuf holds area->w
+ * values. */
+static void
+_gradient_fill(SDL_Surface *surf, const SDL_Rect *area, GradientKind kind,
+               double sx, double sy, double ex, double ey, double radius,
+               const Uint32 *lut, Uint32 *rowbuf)
+{
+    const int bpp = surf->format->BytesPerPixel;
+    const int x0 = area->x, w = area->w;
+    const int y_start = area->y, y_end = area->y + area->h;
+    const size_t row_bytes = (size_t)w * bpp;
+    Uint8 *pixels = (Uint8 *)surf->pixels + (size_t)x0 * bpp;
+    const int pitch = surf->pitch;
+    int x, y, i;
+
+    if (kind == GRADIENT_LINEAR) {
+        /* u(x, y) = a * (x - sx) + b * (y - sy): affine in x and y. */
+        double dx = ex - sx, dy = ey - sy, dd = dx * dx + dy * dy;
+        double a = 0.0, b = 0.0;
+
+        if (dd > 0.0) {
+            a = dx / dd * GRADIENT_LUT_MAX;
+            b = dy / dd * GRADIENT_LUT_MAX;
+        }
+
+        if (a == 0.0) {
+            /* Vertical (or degenerate): one color per row. */
+            for (y = y_start; y < y_end; ++y) {
+                _gradient_fill_row(pixels + (size_t)y * pitch,
+                                   lut[_gradient_index(b * (y - sy))], w,
+                                   bpp);
+            }
+            return;
+        }
+
+        if (b == 0.0) {
+            /* Horizontal: compute one row, copy it to all others. */
+            Uint8 *first = pixels + (size_t)y_start * pitch;
+            for (i = 0; i < w; ++i) {
+                rowbuf[i] = lut[_gradient_index(a * (x0 + i - sx))];
+            }
+            _gradient_store_row(first, rowbuf, w, bpp);
+            for (y = y_start + 1; y < y_end; ++y) {
+                memcpy(pixels + (size_t)y * pitch, first, row_bytes);
+            }
+            return;
+        }
+
+        /* Any angle. */
+        for (y = y_start; y < y_end; ++y) {
+            double u0 = a * (x0 - sx) + b * (y - sy);
+            for (i = 0; i < w; ++i) {
+                rowbuf[i] = lut[_gradient_index(u0 + a * i)];
+            }
+            _gradient_store_row(pixels + (size_t)y * pitch, rowbuf, w, bpp);
+        }
+    }
+    else if (kind == GRADIENT_RADIAL) {
+        /* u = |p - c| / r. A zero radius gives the last color everywhere
+         * except the center pixel. */
+        double scale = radius > 0.0 ? GRADIENT_LUT_MAX / radius : DBL_MAX;
+        /* The circle is symmetric: when the center lies on a pixel or
+         * half-pixel line, mirrored rows/columns are copied instead of
+         * recomputed. */
+        int mirror_y = (2.0 * sy == floor(2.0 * sy));
+        int mirror_x = (2.0 * sx == floor(2.0 * sx));
+        int sym_y = (int)(2.0 * sy), sym_x = (int)(2.0 * sx);
+
+        for (y = y_start; y < y_end; ++y) {
+            Uint8 *row = pixels + (size_t)y * pitch;
+            double ddy = (y - sy) * (y - sy);
+            int ym = sym_y - y;
+
+            if (mirror_y && ym >= y_start && ym < y) {
+                memcpy(row, pixels + (size_t)ym * pitch, row_bytes);
+                continue;
+            }
+            for (i = 0; i < w; ++i) {
+                double ddx;
+                x = x0 + i;
+                if (mirror_x) {
+                    int xm = sym_x - x;
+                    if (xm >= x0 && xm < x) {
+                        rowbuf[i] = rowbuf[xm - x0];
+                        continue;
+                    }
+                }
+                ddx = x - sx;
+                rowbuf[i] =
+                    lut[_gradient_index(sqrt(ddx * ddx + ddy) * scale)];
+            }
+            _gradient_store_row(row, rowbuf, w, bpp);
+        }
+    }
+    else { /* GRADIENT_CONIC */
+        /* u = clockwise angle (screen coordinates, y down) from the
+         * direction center -> end, as a fraction of a full turn. */
+        const double two_pi = 2.0 * M_PI;
+        double angle0 = (ex == sx && ey == sy) ? 0.0 : atan2(ey - sy, ex - sx);
+        double scale = GRADIENT_LUT_MAX / two_pi;
+
+        for (y = y_start; y < y_end; ++y) {
+            double py = y - sy;
+            for (i = 0; i < w; ++i) {
+                double angle = _gradient_atan2(py, x0 + i - sx) - angle0;
+                if (angle < 0.0)
+                    angle += two_pi;
+                if (angle < 0.0)
+                    angle += two_pi;
+                rowbuf[i] = lut[_gradient_index(angle * scale)];
+            }
+            _gradient_store_row(pixels + (size_t)y * pitch, rowbuf, w, bpp);
+        }
+    }
+}
+
+/* Fills a rect (or the whole surface) with a linear, radial, or conic
+ * gradient.
+ *
+ * Returns a Rect bounding the drawn area.
+ */
+static PyObject *
+gradient_rect(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    pgSurfaceObject *surfobj;
+    PyObject *colors, *rectobj = Py_None;
+    PyObject *startobj = Py_None, *endobj = Py_None;
+    const char *kind_str = "linear";
+    SDL_Surface *surf;
+    SDL_Rect r, cliprect, area;
+    SDL_Rect *rect, temp;
+    GradientKind kind;
+    GradientStop *stops;
+    Py_ssize_t n_stops;
+    Uint32 lut[GRADIENT_LUT_SIZE];
+    Uint32 *rowbuf;
+    float fx = 0.0f, fy = 0.0f;
+    double sx, sy, ex, ey, cx, cy, radius = 0.0;
+    int left, top, right, bottom;
+    static char *keywords[] = {"surface", "colors",  "rect", "start_pos",
+                               "end_pos", "kind",    NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O!O|OOOs", keywords,
+                                     &pgSurface_Type, &surfobj, &colors,
+                                     &rectobj, &startobj, &endobj,
+                                     &kind_str)) {
+        return NULL; /* Exception already set. */
+    }
+
+    if (strcmp(kind_str, "linear") == 0) {
+        kind = GRADIENT_LINEAR;
+    }
+    else if (strcmp(kind_str, "radial") == 0) {
+        kind = GRADIENT_RADIAL;
+    }
+    else if (strcmp(kind_str, "conic") == 0) {
+        kind = GRADIENT_CONIC;
+    }
+    else {
+        return PyErr_Format(PyExc_ValueError,
+                            "kind must be 'linear', 'radial' or 'conic', "
+                            "not '%s'",
+                            kind_str);
+    }
+
+    surf = pgSurface_AsSurface(surfobj);
+    if (!surf)
+        return RAISE(pgExc_SDLError, "display Surface quit");
+    if (surf->format->BytesPerPixel <= 0 || surf->format->BytesPerPixel > 4) {
+        return PyErr_Format(PyExc_ValueError,
+                            "unsupported surface bit depth (%d) for drawing",
+                            surf->format->BytesPerPixel);
+    }
+
+    if (rectobj == Py_None) {
+        r.x = 0;
+        r.y = 0;
+        r.w = surf->w;
+        r.h = surf->h;
+    }
+    else {
+        if (!(rect = pgRect_FromObject(rectobj, &temp))) {
+            return RAISE(PyExc_TypeError, "rect argument is invalid");
+        }
+        r = *rect;
+        if (r.w < 0) {
+            r.x += r.w;
+            r.w = -r.w;
+        }
+        if (r.h < 0) {
+            r.y += r.h;
+            r.h = -r.h;
+        }
+    }
+
+    /* Positions are validated even when nothing ends up being drawn. */
+    if (startobj != Py_None && !pg_TwoFloatsFromObj(startobj, &fx, &fy)) {
+        return RAISE(PyExc_TypeError, "invalid start_pos argument");
+    }
+    sx = fx;
+    sy = fy;
+    if (endobj != Py_None && !pg_TwoFloatsFromObj(endobj, &fx, &fy)) {
+        return RAISE(PyExc_TypeError, "invalid end_pos argument");
+    }
+    ex = fx;
+    ey = fy;
+
+    if (!(stops = _gradient_parse_stops(colors, surf, &n_stops))) {
+        return NULL; /* Exception already set. */
+    }
+
+    SDL_GetClipRect(surf, &cliprect);
+    if (r.w == 0 || r.h == 0 || !SDL_IntersectRect(&r, &cliprect, &area)) {
+        PyMem_Free(stops);
+        return pgRect_New4(r.x, r.y, 0, 0);
+    }
+
+    /* Default geometry comes from the (unclipped) rect, using the
+     * coordinates of its first and last pixels. */
+    left = r.x;
+    top = r.y;
+    right = r.x + r.w - 1;
+    bottom = r.y + r.h - 1;
+    cx = (left + right) / 2.0;
+    cy = (top + bottom) / 2.0;
+
+    if (startobj == Py_None) {
+        sx = cx;
+        sy = (kind == GRADIENT_LINEAR) ? top : cy;
+    }
+    if (endobj == Py_None) {
+        switch (kind) {
+            case GRADIENT_LINEAR: /* top to bottom */
+                ex = (startobj == Py_None) ? cx : sx;
+                ey = bottom;
+                break;
+            case GRADIENT_RADIAL: { /* reach the farthest corner */
+                double cdx = MAX(fabs(left - sx), fabs(right - sx));
+                double cdy = MAX(fabs(top - sy), fabs(bottom - sy));
+                radius = sqrt(cdx * cdx + cdy * cdy);
+                ex = sx + radius;
+                ey = sy;
+                break;
+            }
+            default: /* conic: angle 0 points right */
+                ex = sx + 1.0;
+                ey = sy;
+                break;
+        }
+    }
+    if (kind == GRADIENT_RADIAL) {
+        radius = sqrt((ex - sx) * (ex - sx) + (ey - sy) * (ey - sy));
+    }
+
+    _gradient_build_lut(surf->format, stops, n_stops, lut);
+    PyMem_Free(stops);
+
+    rowbuf = PyMem_New(Uint32, area.w);
+    if (!rowbuf) {
+        return PyErr_NoMemory();
+    }
+
+    if (!pgSurface_Lock(surfobj)) {
+        PyMem_Free(rowbuf);
+        return RAISE(PyExc_RuntimeError, "error locking surface");
+    }
+
+    /* The fill touches only C data, so let other Python threads run. */
+    Py_BEGIN_ALLOW_THREADS;
+    _gradient_fill(surf, &area, kind, sx, sy, ex, ey, radius, lut, rowbuf);
+    Py_END_ALLOW_THREADS;
+
+    PyMem_Free(rowbuf);
+    if (!pgSurface_Unlock(surfobj)) {
+        return RAISE(PyExc_RuntimeError, "error unlocking surface");
+    }
+
+    return pgRect_New(&area);
+}
+
 /* List of python functions */
 static PyMethodDef _draw_methods[] = {
     {"aaline", (PyCFunction)aaline, METH_VARARGS | METH_KEYWORDS,
@@ -2583,6 +3155,8 @@ static PyMethodDef _draw_methods[] = {
      DOC_PYGAMEDRAWPOLYGON},
     {"rect", (PyCFunction)rect, METH_VARARGS | METH_KEYWORDS,
      DOC_PYGAMEDRAWRECT},
+    {"gradient_rect", (PyCFunction)gradient_rect, METH_VARARGS | METH_KEYWORDS,
+     DOC_PYGAMEDRAWGRADIENTRECT},
 
     {NULL, NULL, 0, NULL}};
 

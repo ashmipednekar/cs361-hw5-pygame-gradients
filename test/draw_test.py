@@ -6472,6 +6472,395 @@ class DrawArcTest(DrawArcMixin, DrawTestCase):
 #    """
 
 
+### Gradient Rect Testing #####################################################
+
+
+def _gradient_reference(surface, colors, rect=None, start_pos=None,
+                        end_pos=None, kind="linear"):
+    """Slow pure-Python version of draw.gradient_rect, used as a reference.
+
+    Returns a dict mapping each drawn (x, y) to the expected Color, before
+    conversion to the surface's pixel format.
+    """
+    if rect is None:
+        rect = surface.get_rect()
+    rect = pygame.Rect(rect)
+    rect.normalize()
+
+    stops = []
+    for i, item in enumerate(colors):
+        pos = 0.0 if len(colors) == 1 else i / (len(colors) - 1)
+        if (not isinstance(item, str) and len(item) == 2
+                and isinstance(item[0], (int, float))):
+            pos, item = item
+        stops.append((float(pos), pygame.Color(item)))
+
+    def color_at(t):
+        t = min(max(t, 0.0), 1.0)
+        if t <= stops[0][0]:
+            return stops[0][1]
+        if t >= stops[-1][0]:
+            return stops[-1][1]
+        for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+            if t <= p1:
+                f = (t - p0) / (p1 - p0) if p1 > p0 else 1.0
+                return c0.lerp(c1, f)
+        return stops[-1][1]
+
+    left, top = rect.left, rect.top
+    right, bottom = rect.right - 1, rect.bottom - 1
+    center = Vector2((left + right) / 2, (top + bottom) / 2)
+
+    if start_pos is None:
+        start = Vector2(center.x, top) if kind == "linear" else Vector2(center)
+    else:
+        start = Vector2(start_pos)
+    if end_pos is None:
+        if kind == "linear":
+            end = Vector2(start.x, bottom)
+        elif kind == "radial":
+            corner = Vector2(max(abs(left - start.x), abs(right - start.x)),
+                             max(abs(top - start.y), abs(bottom - start.y)))
+            end = start + Vector2(corner.length(), 0)
+        else:
+            end = start + Vector2(1, 0)
+    else:
+        end = Vector2(end_pos)
+
+    d = end - start
+    radius = d.length()
+    angle0 = math.atan2(d.y, d.x) if d.length_squared() else 0.0
+
+    expected = {}
+    for y in range(rect.top, rect.bottom):
+        for x in range(rect.left, rect.right):
+            p = Vector2(x, y) - start
+            if kind == "linear":
+                t = p.dot(d) / d.length_squared() if d.length_squared() else 0
+            elif kind == "radial":
+                if radius:
+                    t = p.length() / radius
+                else:
+                    t = 0.0 if not p.length_squared() else 1.0
+            else:
+                angle = math.atan2(p.y, p.x) - angle0
+                t = (angle % (2 * math.pi)) / (2 * math.pi)
+            expected[(x, y)] = color_at(t)
+    return expected
+
+
+class DrawGradientRectTest(unittest.TestCase):
+    """Tests for draw.gradient_rect()."""
+
+    def assertColorClose(self, actual, expected, tolerance=1, msg=None):
+        for a, e in zip(actual, expected):
+            if abs(a - e) > tolerance:
+                self.fail(f"{tuple(actual)} != {tuple(expected)} "
+                          f"(tolerance {tolerance}) {msg or ''}")
+
+    def check_against_reference(self, surface, tolerance=1, **kwargs):
+        """Draws with gradient_rect and compares every pixel with the
+        Python reference."""
+        drawn = draw.gradient_rect(surface, **kwargs)
+        expected = _gradient_reference(surface, **kwargs)
+        clip = surface.get_clip()
+        for (x, y), color in expected.items():
+            if not clip.collidepoint(x, y):
+                continue
+            want = surface.unmap_rgb(surface.map_rgb(color))
+            self.assertColorClose(surface.get_at((x, y)), want, tolerance,
+                                  f"at {(x, y)}")
+        return drawn
+
+    def test_gradient_rect__returns_rect(self):
+        surface = pygame.Surface((20, 10))
+        self.assertIsInstance(
+            draw.gradient_rect(surface, ["red", "blue"]), pygame.Rect)
+
+    def test_gradient_rect__no_rect_fills_whole_surface(self):
+        surface = pygame.Surface((20, 10))
+        surface.fill((1, 2, 3))
+        drawn = draw.gradient_rect(surface, ["red", "blue"])
+        self.assertEqual(drawn, surface.get_rect())
+        for x in range(20):
+            self.assertEqual(surface.get_at((x, 0)), pygame.Color("red"))
+            self.assertEqual(surface.get_at((x, 9)), pygame.Color("blue"))
+
+    def test_gradient_rect__kwargs(self):
+        surface = pygame.Surface((8, 8))
+        drawn = draw.gradient_rect(
+            surface=surface, colors=("black", "white"), rect=(1, 1, 4, 4),
+            start_pos=(1, 1), end_pos=(4, 1), kind="linear")
+        self.assertEqual(drawn, pygame.Rect(1, 1, 4, 4))
+        self.assertEqual(surface.get_at((1, 2)), pygame.Color("black"))
+        self.assertEqual(surface.get_at((4, 2)), pygame.Color("white"))
+
+    def test_gradient_rect__linear_default_is_vertical(self):
+        surface = pygame.Surface((7, 5))
+        draw.gradient_rect(surface, ["red", "blue"])
+        red, blue = pygame.Color("red"), pygame.Color("blue")
+        for y in range(5):
+            expected = red.lerp(blue, y / 4)
+            for x in range(7):
+                self.assertEqual(surface.get_at((x, y)), expected)
+
+    def test_gradient_rect__linear_horizontal(self):
+        surface = pygame.Surface((9, 6))
+        draw.gradient_rect(surface, ["black", "white"], start_pos=(0, 0),
+                           end_pos=(8, 0))
+        black, white = pygame.Color("black"), pygame.Color("white")
+        for x in range(9):
+            expected = black.lerp(white, x / 8)
+            for y in range(6):
+                self.assertEqual(surface.get_at((x, y)), expected)
+
+    def test_gradient_rect__linear_any_angle(self):
+        surface = pygame.Surface((23, 17))
+        self.check_against_reference(
+            surface, colors=["red", "green", "blue"], start_pos=(2, 3),
+            end_pos=(19, 12))
+
+    def test_gradient_rect__linear_reversed(self):
+        surface = pygame.Surface((10, 10))
+        self.check_against_reference(
+            surface, colors=["yellow", "purple"], start_pos=(9, 9),
+            end_pos=(0, 2))
+
+    def test_gradient_rect__linear_same_points_uses_first_color(self):
+        surface = pygame.Surface((5, 5))
+        draw.gradient_rect(surface, ["red", "blue"], start_pos=(2, 2),
+                           end_pos=(2, 2))
+        for x in range(5):
+            for y in range(5):
+                self.assertEqual(surface.get_at((x, y)), pygame.Color("red"))
+
+    def test_gradient_rect__radial_default(self):
+        surface = pygame.Surface((11, 11))
+        draw.gradient_rect(surface, ["white", "black"], kind="radial")
+        self.assertEqual(surface.get_at((5, 5)), pygame.Color("white"))
+        for corner in ((0, 0), (10, 0), (0, 10), (10, 10)):
+            self.assertEqual(surface.get_at(corner), pygame.Color("black"))
+        self.check_against_reference(surface, colors=["white", "black"],
+                                     kind="radial")
+
+    def test_gradient_rect__radial_symmetry(self):
+        # Even and odd sizes exercise the row/column mirroring.
+        for size in ((12, 9), (9, 12), (10, 10)):
+            surface = pygame.Surface(size)
+            draw.gradient_rect(surface, ["red", "blue", "green"],
+                               kind="radial")
+            w, h = size
+            for x in range(w):
+                for y in range(h):
+                    color = surface.get_at((x, y))
+                    self.assertEqual(color, surface.get_at((w - 1 - x, y)))
+                    self.assertEqual(color, surface.get_at((x, h - 1 - y)))
+
+    def test_gradient_rect__radial_explicit_radius(self):
+        surface = pygame.Surface((20, 20))
+        self.check_against_reference(
+            surface, colors=["blue", "orange"], kind="radial",
+            start_pos=(6.5, 4), end_pos=(6.5, 12))
+        # Beyond the radius, the last color is used.
+        self.assertEqual(surface.get_at((19, 19)), pygame.Color("orange"))
+
+    def test_gradient_rect__radial_zero_radius(self):
+        surface = pygame.Surface((5, 5))
+        draw.gradient_rect(surface, ["red", "blue"], kind="radial",
+                           start_pos=(2, 2), end_pos=(2, 2))
+        self.assertEqual(surface.get_at((2, 2)), pygame.Color("red"))
+        self.assertEqual(surface.get_at((2, 3)), pygame.Color("blue"))
+
+    def test_gradient_rect__conic(self):
+        surface = pygame.Surface((21, 21))
+        draw.gradient_rect(surface, ["black", "white"], kind="conic")
+        black, white = pygame.Color("black"), pygame.Color("white")
+        # Clockwise on screen from pointing right.
+        self.assertEqual(surface.get_at((20, 10)), black)
+        self.assertEqual(surface.get_at((10, 20)), black.lerp(white, 0.25))
+        self.assertEqual(surface.get_at((0, 10)), black.lerp(white, 0.5))
+        self.assertEqual(surface.get_at((10, 0)), black.lerp(white, 0.75))
+        self.check_against_reference(surface, colors=["black", "white"],
+                                     kind="conic")
+
+    def test_gradient_rect__conic_start_direction(self):
+        surface = pygame.Surface((15, 15))
+        self.check_against_reference(
+            surface, colors=["red", "yellow", "red"], kind="conic",
+            start_pos=(7, 7), end_pos=(7, 0))
+        self.assertEqual(surface.get_at((7, 0)), pygame.Color("red"))
+
+    def test_gradient_rect__color_stops(self):
+        surface = pygame.Surface((1, 9))
+        draw.gradient_rect(
+            surface, [(0.0, "red"), (0.5, "red"), (0.5, "blue"), (1, "blue")])
+        for y in range(4):
+            self.assertEqual(surface.get_at((0, y)), pygame.Color("red"))
+        for y in range(5, 9):
+            self.assertEqual(surface.get_at((0, y)), pygame.Color("blue"))
+
+    def test_gradient_rect__stops_not_at_ends(self):
+        surface = pygame.Surface((1, 11))
+        draw.gradient_rect(surface, [(0.2, "black"), (0.8, "white")])
+        for y in (0, 1, 2):
+            self.assertEqual(surface.get_at((0, y)), pygame.Color("black"))
+        for y in (8, 9, 10):
+            self.assertEqual(surface.get_at((0, y)), pygame.Color("white"))
+        # (0.5 - 0.2) / 0.6 is not exactly 0.5 in floating point.
+        self.assertColorClose(surface.get_at((0, 5)),
+                              pygame.Color("black").lerp("white", 0.5))
+
+    def test_gradient_rect__mixed_stop_forms(self):
+        surface = pygame.Surface((3, 17))
+        self.check_against_reference(
+            surface, colors=["red", (0.25, (0, 255, 0)), pygame.Color("blue")])
+
+    def test_gradient_rect__single_color(self):
+        surface = pygame.Surface((4, 4))
+        draw.gradient_rect(surface, ["green"], kind="radial")
+        for x in range(4):
+            for y in range(4):
+                self.assertEqual(surface.get_at((x, y)), pygame.Color("green"))
+
+    def test_gradient_rect__mapped_int_colors(self):
+        surface = pygame.Surface((3, 3))
+        colors = [surface.map_rgb((255, 0, 0)), surface.map_rgb((0, 0, 255))]
+        draw.gradient_rect(surface, colors)
+        self.assertEqual(surface.get_at((0, 0)), pygame.Color("red"))
+        self.assertEqual(surface.get_at((0, 2)), pygame.Color("blue"))
+
+    def test_gradient_rect__alpha_is_written_not_blended(self):
+        surface = pygame.Surface((4, 5), SRCALPHA, 32)
+        surface.fill((255, 255, 255, 255))
+        draw.gradient_rect(surface, [(255, 0, 0, 0), (255, 0, 0, 255)])
+        self.assertEqual(surface.get_at((0, 0)), pygame.Color(255, 0, 0, 0))
+        self.assertEqual(surface.get_at((0, 2)), pygame.Color(255, 0, 0, 128))
+        self.assertEqual(surface.get_at((0, 4)), pygame.Color(255, 0, 0, 255))
+
+    def test_gradient_rect__rect_area_only(self):
+        surface = pygame.Surface((10, 10))
+        surface.fill((1, 2, 3))
+        rect = pygame.Rect(2, 3, 4, 5)
+        drawn = draw.gradient_rect(surface, ["red", "blue"], rect)
+        self.assertEqual(drawn, rect)
+        for x in range(10):
+            for y in range(10):
+                if not rect.collidepoint(x, y):
+                    self.assertEqual(surface.get_at((x, y)), (1, 2, 3, 255))
+        self.assertEqual(surface.get_at((2, 3)), pygame.Color("red"))
+        self.assertEqual(surface.get_at((5, 7)), pygame.Color("blue"))
+
+    def test_gradient_rect__negative_size_rect(self):
+        surface = pygame.Surface((10, 10))
+        drawn = draw.gradient_rect(surface, ["red", "blue"], (6, 8, -4, -5))
+        self.assertEqual(drawn, pygame.Rect(2, 3, 4, 5))
+        self.assertEqual(surface.get_at((2, 3)), pygame.Color("red"))
+        self.assertEqual(surface.get_at((2, 7)), pygame.Color("blue"))
+
+    def test_gradient_rect__surface_clip(self):
+        surface = pygame.Surface((12, 12))
+        surface.fill((1, 2, 3))
+        clip = pygame.Rect(3, 4, 5, 6)
+        surface.set_clip(clip)
+        for kind in ("linear", "radial", "conic"):
+            drawn = self.check_against_reference(
+                surface, colors=["red", "blue"], kind=kind)
+            self.assertEqual(drawn, clip)
+        for x in range(12):
+            for y in range(12):
+                if not clip.collidepoint(x, y):
+                    self.assertEqual(surface.get_at((x, y)), (1, 2, 3, 255))
+
+    def test_gradient_rect__clipped_geometry_uses_full_rect(self):
+        # Clipping must not shift the gradient: it is defined by rect.
+        full = pygame.Surface((10, 10))
+        draw.gradient_rect(full, ["red", "blue"], kind="radial")
+        clipped = pygame.Surface((10, 10))
+        clipped.set_clip((5, 5, 5, 5))
+        draw.gradient_rect(clipped, ["red", "blue"], kind="radial")
+        for x in range(5, 10):
+            for y in range(5, 10):
+                self.assertEqual(clipped.get_at((x, y)), full.get_at((x, y)))
+
+    def test_gradient_rect__nothing_drawn(self):
+        surface = pygame.Surface((10, 10))
+        surface.fill((1, 2, 3))
+        for rect in ((3, 4, 0, 5), (3, 4, 5, 0), (20, 20, 5, 5),
+                     (-10, 2, 5, 5)):
+            drawn = draw.gradient_rect(surface, ["red", "blue"], rect)
+            self.assertEqual(drawn, pygame.Rect(rect[0], rect[1], 0, 0))
+        for x in range(10):
+            for y in range(10):
+                self.assertEqual(surface.get_at((x, y)), (1, 2, 3, 255))
+
+    def test_gradient_rect__bit_depths(self):
+        for depth, tolerance in ((32, 1), (24, 1), (16, 8)):
+            for kind in ("linear", "radial", "conic"):
+                surface = pygame.Surface((13, 9), 0, depth)
+                self.check_against_reference(
+                    surface, tolerance=tolerance,
+                    colors=["red", "green", "blue"], kind=kind,
+                    start_pos=(1, 1) if kind == "linear" else None,
+                    end_pos=(11, 7) if kind == "linear" else None)
+
+    def test_gradient_rect__8_bit_surface(self):
+        surface = pygame.Surface((6, 6), 0, 8)
+        draw.gradient_rect(surface, ["black", "white"])
+        for pos, name in (((0, 0), "black"), ((0, 5), "white")):
+            expected = surface.unmap_rgb(surface.map_rgb(pygame.Color(name)))
+            self.assertEqual(surface.get_at(pos), expected)
+
+    def test_gradient_rect__large_surface(self):
+        surface = pygame.Surface((1000, 700))
+        drawn = draw.gradient_rect(surface, ["red", "blue"],
+                                   start_pos=(0, 0), end_pos=(999, 699))
+        self.assertEqual(drawn, surface.get_rect())
+        self.assertEqual(surface.get_at((0, 0)), pygame.Color("red"))
+        self.assertEqual(surface.get_at((999, 699)), pygame.Color("blue"))
+
+    def test_gradient_rect__invalid_kind(self):
+        surface = pygame.Surface((4, 4))
+        with self.assertRaises(ValueError):
+            draw.gradient_rect(surface, ["red", "blue"], kind="diamond")
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface, ["red", "blue"], kind=1)
+
+    def test_gradient_rect__invalid_colors(self):
+        surface = pygame.Surface((4, 4))
+        with self.assertRaises(ValueError):
+            draw.gradient_rect(surface, [])
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface, "red")
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface, 5)
+        with self.assertRaises((TypeError, ValueError)):
+            draw.gradient_rect(surface, ["red", "not a color"])
+        with self.assertRaises((TypeError, ValueError)):
+            draw.gradient_rect(surface, ["red", (0.5, "not a color")])
+
+    def test_gradient_rect__invalid_stop_positions(self):
+        surface = pygame.Surface((4, 4))
+        for colors in ([(-0.1, "red"), (1, "blue")],
+                       [(0, "red"), (1.5, "blue")],
+                       [(0, "red"), (float("nan"), "blue")],
+                       [(0.6, "red"), (0.4, "blue")]):
+            with self.assertRaises(ValueError, msg=repr(colors)):
+                draw.gradient_rect(surface, colors)
+
+    def test_gradient_rect__invalid_positions_and_rect(self):
+        surface = pygame.Surface((4, 4))
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface, ["red", "blue"], rect="abc")
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface, ["red", "blue"], start_pos=(1,))
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface, ["red", "blue"], end_pos="xy")
+        with self.assertRaises(TypeError):
+            draw.gradient_rect("not a surface", ["red", "blue"])
+        with self.assertRaises(TypeError):
+            draw.gradient_rect(surface)
+
+
 ### Draw Module Testing #######################################################
 
 

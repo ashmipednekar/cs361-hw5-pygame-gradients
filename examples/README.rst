@@ -65,6 +65,10 @@ go_over_there.py
 grid.py
    A simple example of grid-based movement.
 
+gradients.py
+   Demonstrates pygame.draw.gradient_rect() with animated linear, radial
+   and conic gradients, color stops and alpha.
+
 headless_no_windows_needed.py
    Shows how to run Pygame in scripts.
 

@@ -1,4 +1,4 @@
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence, Tuple, Union
 
 from pygame.rect import Rect
 from pygame.surface import Surface
@@ -15,6 +15,14 @@ def rect(
     border_top_right_radius: int = -1,
     border_bottom_left_radius: int = -1,
     border_bottom_right_radius: int = -1,
+) -> Rect: ...
+def gradient_rect(
+    surface: Surface,
+    colors: Sequence[Union[ColorValue, Tuple[float, ColorValue]]],
+    rect: Optional[RectValue] = None,
+    start_pos: Optional[Coordinate] = None,
+    end_pos: Optional[Coordinate] = None,
+    kind: Literal["linear", "radial", "conic"] = "linear",
 ) -> Rect: ...
 def polygon(
     surface: Surface,
